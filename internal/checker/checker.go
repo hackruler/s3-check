@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -94,8 +95,9 @@ func (c *Checker) CheckBuckets(bucketNames []string) ([]BucketResult, error) {
 }
 
 // CheckBucketsStream checks buckets and calls the callback function for each result as it's processed
+// All permission checks for a bucket are run in parallel, then waits 1 second before the next bucket
 func (c *Checker) CheckBucketsStream(bucketNames []string, callback func(BucketResult)) error {
-	for _, bucketName := range bucketNames {
+	for i, bucketName := range bucketNames {
 		// Trim whitespace from bucket name
 		bucketName = strings.TrimSpace(bucketName)
 		if bucketName == "" {
@@ -109,32 +111,93 @@ func (c *Checker) CheckBucketsStream(bucketNames []string, callback func(BucketR
 			BucketName: bucketName,
 		}
 
-		// Check GET-ACL
-		result.GetACL = c.checkGetACLWithContext(ctx, bucketName)
+		// Use WaitGroup to wait for all parallel checks to complete
+		var wg sync.WaitGroup
+		wg.Add(8) // 8 permission checks
 
-		// Check PUT-ACL
-		result.PutACL = c.checkPutACLWithContext(ctx, bucketName)
+		// Use channels to safely collect results from goroutines
+		type checkResult struct {
+			field string
+			value string
+		}
+		resultsChan := make(chan checkResult, 8)
 
-		// Check ANON-GET (Anonymous GET)
-		result.AnonGet = c.checkAnonGet(bucketName)
+		// Run all checks in parallel
+		go func() {
+			defer wg.Done()
+			resultsChan <- checkResult{"GetACL", c.checkGetACLWithContext(ctx, bucketName)}
+		}()
 
-		// Check AUTH-GET (Authenticated GET)
-		result.AuthGet = c.checkAuthGet(bucketName)
+		go func() {
+			defer wg.Done()
+			resultsChan <- checkResult{"PutACL", c.checkPutACLWithContext(ctx, bucketName)}
+		}()
 
-		// Check ANON-WRITE (Anonymous WRITE)
-		result.AnonWrite = c.checkAnonWrite(bucketName)
+		go func() {
+			defer wg.Done()
+			resultsChan <- checkResult{"AnonGet", c.checkAnonGet(bucketName)}
+		}()
 
-		// Check AUTH-WRITE (Authenticated WRITE)
-		result.AuthWrite = c.checkAuthWrite(bucketName)
+		go func() {
+			defer wg.Done()
+			resultsChan <- checkResult{"AuthGet", c.checkAuthGet(bucketName)}
+		}()
 
-		// Check ANON-DEL (Anonymous DELETE)
-		result.AnonDel = c.checkAnonDel(bucketName)
+		go func() {
+			defer wg.Done()
+			resultsChan <- checkResult{"AnonWrite", c.checkAnonWrite(bucketName)}
+		}()
 
-		// Check AUTH-DEL (Authenticated DELETE)
-		result.AuthDel = c.checkAuthDel(bucketName)
+		go func() {
+			defer wg.Done()
+			resultsChan <- checkResult{"AuthWrite", c.checkAuthWrite(bucketName)}
+		}()
+
+		go func() {
+			defer wg.Done()
+			resultsChan <- checkResult{"AnonDel", c.checkAnonDel(bucketName)}
+		}()
+
+		go func() {
+			defer wg.Done()
+			resultsChan <- checkResult{"AuthDel", c.checkAuthDel(bucketName)}
+		}()
+
+		// Wait for all checks to complete and collect results
+		go func() {
+			wg.Wait()
+			close(resultsChan)
+		}()
+
+		// Collect all results
+		for res := range resultsChan {
+			switch res.field {
+			case "GetACL":
+				result.GetACL = res.value
+			case "PutACL":
+				result.PutACL = res.value
+			case "AnonGet":
+				result.AnonGet = res.value
+			case "AuthGet":
+				result.AuthGet = res.value
+			case "AnonWrite":
+				result.AnonWrite = res.value
+			case "AuthWrite":
+				result.AuthWrite = res.value
+			case "AnonDel":
+				result.AnonDel = res.value
+			case "AuthDel":
+				result.AuthDel = res.value
+			}
+		}
 
 		// Call callback immediately with the result
 		callback(result)
+
+		// Wait 100ms before processing next bucket (except for the last one)
+		if i < len(bucketNames)-1 {
+			time.Sleep(100 * time.Millisecond)
+		}
 	}
 
 	return nil
