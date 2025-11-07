@@ -7,10 +7,6 @@ import (
 	"os/exec"
 	"strings"
 	"time"
-
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
 const (
@@ -19,10 +15,8 @@ const (
 )
 
 type Checker struct {
-	client      *s3.Client
-	ctx         context.Context
-	verbose     bool
-	regionCache map[string]string // Cache bucket -> region mapping
+	ctx     context.Context
+	verbose bool
 }
 
 type BucketResult struct {
@@ -38,17 +32,9 @@ type BucketResult struct {
 }
 
 func NewChecker() (*Checker, error) {
-	cfg, err := config.LoadDefaultConfig(context.Background())
-	if err != nil {
-		return nil, fmt.Errorf("unable to load AWS config: %w", err)
-	}
-
-	client := s3.NewFromConfig(cfg)
 	return &Checker{
-		client:      client,
-		ctx:         context.Background(),
-		verbose:     false,
-		regionCache: make(map[string]string),
+		ctx:     context.Background(),
+		verbose: false,
 	}, nil
 }
 
@@ -57,16 +43,16 @@ func (c *Checker) SetVerbose(v bool) {
 }
 
 func (c *Checker) ListAllBuckets() ([]string, error) {
-	result, err := c.client.ListBuckets(c.ctx, &s3.ListBucketsInput{})
+	// Use AWS CLI to list buckets
+	cmd := exec.Command("aws", "s3api", "list-buckets", "--query", "Buckets[].Name", "--output", "text")
+	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("error listing buckets: %w", err)
 	}
 
-	buckets := make([]string, 0, len(result.Buckets))
-	for _, bucket := range result.Buckets {
-		buckets = append(buckets, *bucket.Name)
-	}
-	return buckets, nil
+	// Parse output - each bucket name on a new line
+	bucketNames := strings.Fields(string(output))
+	return bucketNames, nil
 }
 
 func (c *Checker) CheckBuckets(bucketNames []string) ([]BucketResult, error) {
@@ -227,29 +213,22 @@ func (c *Checker) checkAnonGet(bucketName string) string {
 	// Then try to access with anonymous credentials
 	testKey := fmt.Sprintf("test-%d", time.Now().UnixNano())
 
-	// Check public access block
-	pab, err := c.client.GetPublicAccessBlock(c.ctx, &s3.GetPublicAccessBlockInput{
-		Bucket: aws.String(bucketName),
-	})
-	if err != nil && c.verbose {
-		// Log error but continue - error might mean no PAB is configured
-		errStr := err.Error()
-		if !strings.Contains(errStr, "NoSuchPublicAccessBlockConfiguration") {
-			fmt.Fprintf(os.Stderr, "[ANON-GET] %s (public-access-block): %v\n", bucketName, err)
+	// Check public access block using AWS CLI
+	pabCmd := exec.Command("aws", "s3api", "get-public-access-block", "--bucket", bucketName)
+	pabOutput, pabErr := pabCmd.CombinedOutput()
+	if pabErr != nil {
+		// Error might mean no PAB is configured (which is OK)
+		errStr := string(pabOutput)
+		if c.verbose && !strings.Contains(errStr, "NoSuchPublicAccessBlockConfiguration") {
+			fmt.Fprintf(os.Stderr, "[ANON-GET] %s (public-access-block): %v\n", bucketName, errStr)
 		}
-	}
-	if err == nil && pab.PublicAccessBlockConfiguration != nil {
-		// If public access is blocked, anonymous access is denied
-		if pab.PublicAccessBlockConfiguration.BlockPublicAcls != nil && *pab.PublicAccessBlockConfiguration.BlockPublicAcls {
-			return "DENIED"
-		}
-		if pab.PublicAccessBlockConfiguration.BlockPublicPolicy != nil && *pab.PublicAccessBlockConfiguration.BlockPublicPolicy {
-			return "DENIED"
-		}
-		if pab.PublicAccessBlockConfiguration.IgnorePublicAcls != nil && *pab.PublicAccessBlockConfiguration.IgnorePublicAcls {
-			return "DENIED"
-		}
-		if pab.PublicAccessBlockConfiguration.RestrictPublicBuckets != nil && *pab.PublicAccessBlockConfiguration.RestrictPublicBuckets {
+	} else {
+		// Parse JSON output to check if public access is blocked
+		pabStr := string(pabOutput)
+		if strings.Contains(pabStr, `"BlockPublicAcls": true`) ||
+			strings.Contains(pabStr, `"BlockPublicPolicy": true`) ||
+			strings.Contains(pabStr, `"IgnorePublicAcls": true`) ||
+			strings.Contains(pabStr, `"RestrictPublicBuckets": true`) {
 			return "DENIED"
 		}
 	}
@@ -277,22 +256,21 @@ func (c *Checker) checkAnonGet(bucketName string) string {
 }
 
 func (c *Checker) checkBucketPolicyForAnonGet(bucketName string) string {
-	// Check bucket policy for public read access
-	policy, err := c.client.GetBucketPolicy(c.ctx, &s3.GetBucketPolicyInput{
-		Bucket: aws.String(bucketName),
-	})
+	// Check bucket policy for public read access using AWS CLI
+	cmd := exec.Command("aws", "s3api", "get-bucket-policy", "--bucket", bucketName)
+	output, err := cmd.CombinedOutput()
 	if err != nil {
 		if c.verbose {
-			fmt.Fprintf(os.Stderr, "[ANON-GET] %s (policy): %v\n", bucketName, err)
+			fmt.Fprintf(os.Stderr, "[ANON-GET] %s (policy): %v\n", bucketName, string(output))
 		}
 		// If we can't get the policy, we can't determine anonymous access from policy
 		// Return DENIED as conservative default
 		return "DENIED"
 	}
 
-	// Simple check: if policy exists and contains "Principal": "*", it might allow anonymous access
-	// This is a simplified check - full policy parsing would be more accurate
-	policyStr := *policy.Policy
+	// Parse JSON output - extract Policy field
+	policyStr := string(output)
+	// Simple check: if policy contains "Principal": "*", it might allow anonymous access
 	if strings.Contains(policyStr, `"Principal":"*"`) || strings.Contains(policyStr, `"Principal":{"AWS":"*"}`) {
 		if strings.Contains(policyStr, `"s3:GetObject"`) || strings.Contains(policyStr, `"s3:Get*"`) {
 			return "OK"
@@ -325,27 +303,22 @@ func (c *Checker) checkAuthGet(bucketName string) string {
 }
 
 func (c *Checker) checkAnonWrite(bucketName string) string {
-	// Check public access block first
-	pab, err := c.client.GetPublicAccessBlock(c.ctx, &s3.GetPublicAccessBlockInput{
-		Bucket: aws.String(bucketName),
-	})
-	if err != nil && c.verbose {
-		errStr := err.Error()
-		if !strings.Contains(errStr, "NoSuchPublicAccessBlockConfiguration") {
-			fmt.Fprintf(os.Stderr, "[ANON-WRITE] %s (public-access-block): %v\n", bucketName, err)
+	// Check public access block using AWS CLI
+	pabCmd := exec.Command("aws", "s3api", "get-public-access-block", "--bucket", bucketName)
+	pabOutput, pabErr := pabCmd.CombinedOutput()
+	if pabErr != nil {
+		// Error might mean no PAB is configured (which is OK)
+		errStr := string(pabOutput)
+		if c.verbose && !strings.Contains(errStr, "NoSuchPublicAccessBlockConfiguration") {
+			fmt.Fprintf(os.Stderr, "[ANON-WRITE] %s (public-access-block): %v\n", bucketName, errStr)
 		}
-	}
-	if err == nil && pab.PublicAccessBlockConfiguration != nil {
-		if pab.PublicAccessBlockConfiguration.BlockPublicAcls != nil && *pab.PublicAccessBlockConfiguration.BlockPublicAcls {
-			return "DENIED"
-		}
-		if pab.PublicAccessBlockConfiguration.BlockPublicPolicy != nil && *pab.PublicAccessBlockConfiguration.BlockPublicPolicy {
-			return "DENIED"
-		}
-		if pab.PublicAccessBlockConfiguration.IgnorePublicAcls != nil && *pab.PublicAccessBlockConfiguration.IgnorePublicAcls {
-			return "DENIED"
-		}
-		if pab.PublicAccessBlockConfiguration.RestrictPublicBuckets != nil && *pab.PublicAccessBlockConfiguration.RestrictPublicBuckets {
+	} else {
+		// Parse JSON output to check if public access is blocked
+		pabStr := string(pabOutput)
+		if strings.Contains(pabStr, `"BlockPublicAcls": true`) ||
+			strings.Contains(pabStr, `"BlockPublicPolicy": true`) ||
+			strings.Contains(pabStr, `"IgnorePublicAcls": true`) ||
+			strings.Contains(pabStr, `"RestrictPublicBuckets": true`) {
 			return "DENIED"
 		}
 	}
@@ -353,7 +326,7 @@ func (c *Checker) checkAnonWrite(bucketName string) string {
 	// Use AWS CLI with --no-sign-request for anonymous write
 	testKey := fmt.Sprintf("test-anon-write-%d", time.Now().UnixNano())
 	tmpFile := fmt.Sprintf("/tmp/test-%s-%d", bucketName, time.Now().UnixNano())
-	err = os.WriteFile(tmpFile, []byte("test"), 0644)
+	err := os.WriteFile(tmpFile, []byte("test"), 0644)
 	if err != nil {
 		if c.verbose {
 			fmt.Fprintf(os.Stderr, "[ANON-WRITE] %s (write temp): %v\n", bucketName, err)
@@ -416,27 +389,22 @@ func (c *Checker) checkAuthWrite(bucketName string) string {
 }
 
 func (c *Checker) checkAnonDel(bucketName string) string {
-	// Check public access block first
-	pab, err := c.client.GetPublicAccessBlock(c.ctx, &s3.GetPublicAccessBlockInput{
-		Bucket: aws.String(bucketName),
-	})
-	if err != nil && c.verbose {
-		errStr := err.Error()
-		if !strings.Contains(errStr, "NoSuchPublicAccessBlockConfiguration") {
-			fmt.Fprintf(os.Stderr, "[ANON-DEL] %s (public-access-block): %v\n", bucketName, err)
+	// Check public access block using AWS CLI
+	pabCmd := exec.Command("aws", "s3api", "get-public-access-block", "--bucket", bucketName)
+	pabOutput, pabErr := pabCmd.CombinedOutput()
+	if pabErr != nil {
+		// Error might mean no PAB is configured (which is OK)
+		errStr := string(pabOutput)
+		if c.verbose && !strings.Contains(errStr, "NoSuchPublicAccessBlockConfiguration") {
+			fmt.Fprintf(os.Stderr, "[ANON-DEL] %s (public-access-block): %v\n", bucketName, errStr)
 		}
-	}
-	if err == nil && pab.PublicAccessBlockConfiguration != nil {
-		if pab.PublicAccessBlockConfiguration.BlockPublicAcls != nil && *pab.PublicAccessBlockConfiguration.BlockPublicAcls {
-			return "DENIED"
-		}
-		if pab.PublicAccessBlockConfiguration.BlockPublicPolicy != nil && *pab.PublicAccessBlockConfiguration.BlockPublicPolicy {
-			return "DENIED"
-		}
-		if pab.PublicAccessBlockConfiguration.IgnorePublicAcls != nil && *pab.PublicAccessBlockConfiguration.IgnorePublicAcls {
-			return "DENIED"
-		}
-		if pab.PublicAccessBlockConfiguration.RestrictPublicBuckets != nil && *pab.PublicAccessBlockConfiguration.RestrictPublicBuckets {
+	} else {
+		// Parse JSON output to check if public access is blocked
+		pabStr := string(pabOutput)
+		if strings.Contains(pabStr, `"BlockPublicAcls": true`) ||
+			strings.Contains(pabStr, `"BlockPublicPolicy": true`) ||
+			strings.Contains(pabStr, `"IgnorePublicAcls": true`) ||
+			strings.Contains(pabStr, `"RestrictPublicBuckets": true`) {
 			return "DENIED"
 		}
 	}
@@ -444,7 +412,7 @@ func (c *Checker) checkAnonDel(bucketName string) string {
 	// First create a test object with authenticated client (using AWS CLI)
 	testKey := fmt.Sprintf("test-anon-del-%d", time.Now().UnixNano())
 	tmpFile := fmt.Sprintf("/tmp/test-%s-%d", bucketName, time.Now().UnixNano())
-	err = os.WriteFile(tmpFile, []byte("test"), 0644)
+	err := os.WriteFile(tmpFile, []byte("test"), 0644)
 	if err != nil {
 		if c.verbose {
 			fmt.Fprintf(os.Stderr, "[ANON-DEL] %s (write temp): %v\n", bucketName, err)
